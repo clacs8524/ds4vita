@@ -1,21 +1,46 @@
-#include <psp2kern/kernel/modulemgr.h>
-#include <psp2kern/kernel/threadmgr.h>
-#include <psp2kern/kernel/sysmem.h>
-#include <psp2kern/kernel/suspend.h>
+#include <psp2/motion.h>
+#include <psp2/touch.h>
 #include <psp2kern/bt.h>
 #include <psp2kern/ctrl.h>
-#include <psp2/touch.h>
-#include <psp2/motion.h>
+#include <psp2kern/kernel/modulemgr.h>
+#include <psp2kern/kernel/suspend.h>
+#include <psp2kern/kernel/sysmem.h>
+#include <psp2kern/kernel/threadmgr.h>
 #include <taihen.h>
+
 #include "log.h"
 
-#define DS4_VID   0x054C
-#define DS4_PID   0x05C4
+/*
+ * ds4vita (xerpi) + reparacion del "35-second drop" de SceBt para DS4
+ * (054C:05C4 / 054C:09CC) en firmware 3.65.
+ *
+ * CAUSA: al configurar el canal interrupt de un DS4 por Bluetooth, SceBt
+ * arma una ventana de gracia de 35 s. Al expirar, sub_12800 (handler RX del
+ * canal interrupt, PSM 0x13) ejecuta:
+ *
+ *   0x21929D2  movs   r3, #1             ; <<< ESTE
+ *   0x21929D4  strb.w r3, [conn+0x3C85]  ; drop flag = 1
+ *
+ * y a partir de ahi todo DATA 0xA1 se descarta para siempre.
+ *
+ * REPARACION: un unico halfword en seg0+0x129D2:
+ *   movs r3, #1 (01 23)  ->  movs r3, #0 (00 23)
+ *
+ * Seguridad: solo se aplica si SceBt.nid == SCEBT_FW365_NID y los bytes
+ * esperados [01 23] estan presentes. Se libera en module_stop.
+ */
+#define SCEBT_FW365_NID 0x67E0C2EBu
+#define DROP_FIX_OFFSET 0x129D2u
+
+#define DS4_VID 0x054C
+#define DS4_PID 0x05C4
 #define DS4_2_PID 0x09CC
 
 #define DS4_TOUCHPAD_W 1920
 #define DS4_TOUCHPAD_H 940
 #define DS4_ANALOG_THRESHOLD 3
+
+#define BT_THREAD_SLEEP_MS 1000 // tiempo de escritura del log
 
 #define VITA_FRONT_TOUCHSCREEN_W 1920
 #define VITA_FRONT_TOUCHSCREEN_H 1080
@@ -23,77 +48,77 @@
 #define abs(x) (((x) < 0) ? -(x) : (x))
 
 struct ds4_input_report {
-	unsigned char report_id;
-	unsigned char left_x;
-	unsigned char left_y;
-	unsigned char right_x;
-	unsigned char right_y;
+  unsigned char report_id;
+  unsigned char left_x;
+  unsigned char left_y;
+  unsigned char right_x;
+  unsigned char right_y;
 
-	unsigned char dpad     : 4;
-	unsigned char square   : 1;
-	unsigned char cross    : 1;
-	unsigned char circle   : 1;
-	unsigned char triangle : 1;
+  unsigned char dpad : 4;
+  unsigned char square : 1;
+  unsigned char cross : 1;
+  unsigned char circle : 1;
+  unsigned char triangle : 1;
 
-	unsigned char l1      : 1;
-	unsigned char r1      : 1;
-	unsigned char l2      : 1;
-	unsigned char r2      : 1;
-	unsigned char share   : 1;
-	unsigned char options : 1;
-	unsigned char l3      : 1;
-	unsigned char r3      : 1;
+  unsigned char l1 : 1;
+  unsigned char r1 : 1;
+  unsigned char l2 : 1;
+  unsigned char r2 : 1;
+  unsigned char share : 1;
+  unsigned char options : 1;
+  unsigned char l3 : 1;
+  unsigned char r3 : 1;
 
-	unsigned char ps   : 1;
-	unsigned char tpad : 1;
-	unsigned char cnt1 : 6;
+  unsigned char ps : 1;
+  unsigned char tpad : 1;
+  unsigned char cnt1 : 6;
 
-	unsigned char l_trigger;
-	unsigned char r_trigger;
+  unsigned char l_trigger;
+  unsigned char r_trigger;
 
-	unsigned char cnt2;
-	unsigned char cnt3;
+  unsigned char cnt2;
+  unsigned char cnt3;
 
-	unsigned char battery;
+  unsigned char battery;
 
-	signed short accel_x;
-	signed short accel_y;
-	signed short accel_z;
+  signed short accel_x;
+  signed short accel_y;
+  signed short accel_z;
 
-	union {
-		signed short roll;
-		signed short gyro_z;
-	};
-	union {
-		signed short yaw;
-		signed short gyro_y;
-	};
-	union {
-		signed short pitch;
-		signed short gyro_x;
-	};
+  union {
+    signed short roll;
+    signed short gyro_z;
+  };
+  union {
+    signed short yaw;
+    signed short gyro_y;
+  };
+  union {
+    signed short pitch;
+    signed short gyro_x;
+  };
 
-	unsigned char unk1[5];
+  unsigned char unk1[5];
 
-	unsigned char battery_level : 4;
-	unsigned char usb_plugged   : 1;
-	unsigned char headphones    : 1;
-	unsigned char microphone    : 1;
-	unsigned char padding       : 1;
+  unsigned char battery_level : 4;
+  unsigned char usb_plugged : 1;
+  unsigned char headphones : 1;
+  unsigned char microphone : 1;
+  unsigned char padding : 1;
 
-	unsigned char unk2[2];
-	unsigned char trackpadpackets;
-	unsigned char packetcnt;
+  unsigned char unk2[2];
+  unsigned char trackpadpackets;
+  unsigned char packetcnt;
 
-	unsigned int finger1_id        : 7;
-	unsigned int finger1_activelow : 1;
-	unsigned int finger1_x         : 12;
-	unsigned int finger1_y         : 12;
+  unsigned int finger1_id : 7;
+  unsigned int finger1_activelow : 1;
+  unsigned int finger1_x : 12;
+  unsigned int finger1_y : 12;
 
-	unsigned int finger2_id        : 7;
-	unsigned int finger2_activelow : 1;
-	unsigned int finger2_x         : 12;
-	unsigned int finger2_y         : 12;
+  unsigned int finger2_id : 7;
+  unsigned int finger2_activelow : 1;
+  unsigned int finger2_x : 12;
+  unsigned int finger2_y : 12;
 
 } __attribute__((packed, aligned(32)));
 
@@ -102,6 +127,8 @@ static SceUID bt_thread_uid = -1;
 static SceUID bt_cb_uid = -1;
 static int bt_thread_run = 1;
 
+static SceUID drop_fix_uid = -1;
+
 static int ds4_connected = 0;
 static unsigned int ds4_mac0 = 0;
 static unsigned int ds4_mac1 = 0;
@@ -109,675 +136,698 @@ static unsigned int ds4_mac1 = 0;
 static struct ds4_input_report ds4_input;
 
 #define DECL_FUNC_HOOK(name, ...) \
-	static tai_hook_ref_t name##_ref; \
-	static SceUID name##_hook_uid = -1; \
-	static int name##_hook_func(__VA_ARGS__)
+    static tai_hook_ref_t name##_ref; \
+    static SceUID name##_hook_uid = -1; \
+    static int name##_hook_func(__VA_ARGS__)
 
-static inline void ds4_input_reset(void)
-{
-	memset(&ds4_input, 0, sizeof(ds4_input));
+static inline void ds4_input_reset(void) { memset(&ds4_input, 0, sizeof(ds4_input)); }
+
+static int is_ds4(const unsigned short vid_pid[2]) {
+  return (vid_pid[0] == DS4_VID) && ((vid_pid[1] == DS4_PID) || (vid_pid[1] == DS4_2_PID));
 }
 
-static int is_ds4(const unsigned short vid_pid[2])
-{
-	return (vid_pid[0] == DS4_VID) &&
-		((vid_pid[1] == DS4_PID) || (vid_pid[1] == DS4_2_PID));
+static inline void *mempool_alloc(unsigned int size) { return ksceKernelAllocHeapMemory(bt_mempool_uid, size); }
+
+static inline void mempool_free(void *ptr) { ksceKernelFreeHeapMemory(bt_mempool_uid, ptr); }
+
+static int ds4_send_report(unsigned int mac0, unsigned int mac1, uint8_t flags, uint8_t report, size_t len,
+                           const void *data) {
+  SceBtHidRequest *req;
+  unsigned char *buf;
+
+  req = mempool_alloc(sizeof(*req));
+  if (!req) {
+    LOG("Error allocatin BT HID Request\n");
+    return -1;
+  }
+
+  if ((buf = mempool_alloc((len + 1) * sizeof(*buf))) == NULL) {
+    LOG("Memory allocation error (mesg array)\n");
+    mempool_free(req);
+    return -1;
+  }
+
+  buf[0] = report;
+  memcpy(buf + 1, data, len);
+
+  memset(req, 0, sizeof(*req));
+  req->type = 1;  // 0xA2 -> type = 1
+  req->buffer = buf;
+  req->length = len + 1;
+  req->next = req;
+
+  TEST_CALL(ksceBtHidTransfer, mac0, mac1, req);
+
+  mempool_free(buf);
+  mempool_free(req);
+
+  return 0;
 }
 
-static inline void *mempool_alloc(unsigned int size)
-{
-	return ksceKernelAllocHeapMemory(bt_mempool_uid, size);
+static int ds4_send_0x11_report(unsigned int mac0, unsigned int mac1) {
+  unsigned char data[] = {
+      0x80, 0x0F, 0x00, 0x00, 0x00,
+      0x00,  // Motor right
+      0x00,  // Motor left
+      0xFF,  // R
+      0x00,  // G
+      0xFF,  // B
+      0xFF,  // Blink on
+      0x00,  // Blink off
+  };
+
+  if (ds4_send_report(mac0, mac1, 0, 0x11, sizeof(data), data)) {
+    LOG("Status request error\n");
+    return -1;
+  }
+
+  return 0;
 }
 
-static inline void mempool_free(void *ptr)
-{
-	ksceKernelFreeHeapMemory(bt_mempool_uid, ptr);
+static void reset_input_emulation(void) {
+  ksceCtrlSetButtonEmulation(0, 0, 0, 0, 32);
+  ksceCtrlSetAnalogEmulation(0, 0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0);
 }
 
-static int ds4_send_report(unsigned int mac0, unsigned int mac1, uint8_t flags, uint8_t report,
-			    size_t len, const void *data)
-{
-	SceBtHidRequest *req;
-	unsigned char *buf;
+static void set_input_emulation(struct ds4_input_report *ds4) {
+  unsigned int buttons = 0;
+  int js_moved = 0;
 
-	req = mempool_alloc(sizeof(*req));
-	if (!req) {
-		LOG("Error allocatin BT HID Request\n");
-		return -1;
-	}
+  if (ds4->cross) buttons |= SCE_CTRL_CROSS;
+  if (ds4->circle) buttons |= SCE_CTRL_CIRCLE;
+  if (ds4->triangle) buttons |= SCE_CTRL_TRIANGLE;
+  if (ds4->square) buttons |= SCE_CTRL_SQUARE;
 
-	if ((buf = mempool_alloc((len + 1) * sizeof(*buf))) == NULL) {
-		LOG("Memory allocation error (mesg array)\n");
-		return -1;
-	}
+  if (ds4->dpad == 0 || ds4->dpad == 1 || ds4->dpad == 7) buttons |= SCE_CTRL_UP;
+  if (ds4->dpad == 1 || ds4->dpad == 2 || ds4->dpad == 3) buttons |= SCE_CTRL_RIGHT;
+  if (ds4->dpad == 3 || ds4->dpad == 4 || ds4->dpad == 5) buttons |= SCE_CTRL_DOWN;
+  if (ds4->dpad == 5 || ds4->dpad == 6 || ds4->dpad == 7) buttons |= SCE_CTRL_LEFT;
 
-	buf[0] = report;
-	memcpy(buf + 1, data, len);
+  if (ds4->l1) buttons |= SCE_CTRL_L1;
+  if (ds4->r1) buttons |= SCE_CTRL_R1;
 
-	memset(req, 0, sizeof(*req));
-	req->type = 1; // 0xA2 -> type = 1
-	req->buffer = buf;
-	req->length = len + 1;
-	req->next = req;
+  if (ds4->l2) buttons |= SCE_CTRL_LTRIGGER;
+  if (ds4->r2) buttons |= SCE_CTRL_RTRIGGER;
 
-	TEST_CALL(ksceBtHidTransfer, mac0, mac1, req);
+  if (ds4->l3) buttons |= SCE_CTRL_L3;
+  if (ds4->r3) buttons |= SCE_CTRL_R3;
 
-	mempool_free(buf);
-	mempool_free(req);
+  if (ds4->share) buttons |= SCE_CTRL_SELECT;
+  if (ds4->options) buttons |= SCE_CTRL_START;
+  if (ds4->ps) buttons |= SCE_CTRL_INTERCEPTED;
 
-	return 0;
+  if ((abs(ds4->left_x - 128) > DS4_ANALOG_THRESHOLD) || (abs(ds4->left_y - 128) > DS4_ANALOG_THRESHOLD) ||
+      (abs(ds4->right_x - 128) > DS4_ANALOG_THRESHOLD) || (abs(ds4->right_y - 128) > DS4_ANALOG_THRESHOLD) ||
+      ds4->l_trigger > DS4_ANALOG_THRESHOLD || ds4->r_trigger > DS4_ANALOG_THRESHOLD) {
+    js_moved = 1;
+  }
+
+  ksceCtrlSetButtonEmulation(0, 0, buttons, buttons, 32);
+
+  ksceCtrlSetAnalogEmulation(0, 0, ds4->left_x, ds4->left_y, ds4->right_x, ds4->right_y, ds4->left_x, ds4->left_y,
+                             ds4->right_x, ds4->right_y, 1);
+
+  if (buttons != 0 || js_moved) ksceKernelPowerTick(0);
 }
 
-static int ds4_send_0x11_report(unsigned int mac0, unsigned int mac1)
-{
-	unsigned char data[] = {
-		0x80,
-		0x0F,
-		0x00,
-		0x00,
-		0x00,
-		0x00, // Motor right
-		0x00, // Motor left
-		0xFF, // R
-		0x00, // G
-		0xFF, // B
-		0xFF, // Blink on
-		0x00, // Blink off
-	};
+static void patch_analogdata(int port, SceCtrlData *pad_data, int count, struct ds4_input_report *ds4) {
+  unsigned int i;
 
-	if (ds4_send_report(mac0, mac1, 0, 0x11, sizeof(data), data)) {
-		LOG("Status request error\n");
-		return -1;
-	}
+  for (i = 0; i < count; i++) {
+    SceCtrlData k_data;
 
-	return 0;
+    ksceKernelMemcpyUserToKernel(&k_data, pad_data, sizeof(k_data));
+    if (abs(ds4->left_x - 128) > DS4_ANALOG_THRESHOLD) k_data.lx = ds4->left_x;
+    if (abs(ds4->left_y - 128) > DS4_ANALOG_THRESHOLD) k_data.ly = ds4->left_y;
+    if (abs(ds4->right_x - 128) > DS4_ANALOG_THRESHOLD) k_data.rx = ds4->right_x;
+    if (abs(ds4->right_y - 128) > DS4_ANALOG_THRESHOLD) k_data.ry = ds4->right_y;
+    if (ds4->l_trigger > DS4_ANALOG_THRESHOLD) k_data.lt = ds4->l_trigger;
+    if (ds4->r_trigger > DS4_ANALOG_THRESHOLD) k_data.rt = ds4->r_trigger;
+    ksceKernelMemcpyKernelToUser(pad_data, &k_data, sizeof(k_data));
+
+    pad_data++;
+  }
 }
 
-static void reset_input_emulation()
-{
-	ksceCtrlSetButtonEmulation(0, 0, 0, 0, 32);
-	ksceCtrlSetAnalogEmulation(0, 0, 0x80, 0x80, 0x80, 0x80,
-		0x80, 0x80, 0x80, 0x80, 0);
+DECL_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, SceCtrlPortInfo *info) {
+  int ret = TAI_CONTINUE(int, SceCtrl_ksceCtrlGetControllerPortInfo_ref, info);
+
+  if (ret >= 0 && ds4_connected) {
+    info->port[1] = SCE_CTRL_TYPE_DS4;
+  }
+
+  return ret;
 }
 
-static void set_input_emulation(struct ds4_input_report *ds4)
-{
-	unsigned int buttons = 0;
-	int js_moved = 0;
+DECL_FUNC_HOOK(SceCtrl_sceCtrlGetBatteryInfo, int port, SceUInt8 *batt) {
+  int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlGetBatteryInfo_ref, port, batt);
 
-	if (ds4->cross)
-		buttons |= SCE_CTRL_CROSS;
-	if (ds4->circle)
-		buttons |= SCE_CTRL_CIRCLE;
-	if (ds4->triangle)
-		buttons |= SCE_CTRL_TRIANGLE;
-	if (ds4->square)
-		buttons |= SCE_CTRL_SQUARE;
+  if (ds4_connected && port == 1) {
+    SceUInt8 k_batt;
+    ksceKernelMemcpyUserToKernel(&k_batt, batt, sizeof(k_batt));
+    if (ds4_input.usb_plugged) {
+      k_batt = ds4_input.battery_level <= 10 ? 0xEE : 0xEF;
+    } else {
+      if (ds4_input.battery_level == 0)
+        k_batt = 0;
+      else
+        k_batt = (ds4_input.battery_level / 2) + 1;
+      if (k_batt > 5) k_batt = 5;
+    }
+    ksceKernelMemcpyKernelToUser(batt, &k_batt, sizeof(k_batt));
+    return 0;
+  }
 
-	if (ds4->dpad == 0 || ds4->dpad == 1 || ds4->dpad == 7)
-		buttons |= SCE_CTRL_UP;
-	if (ds4->dpad == 1 || ds4->dpad == 2 || ds4->dpad == 3)
-		buttons |= SCE_CTRL_RIGHT;
-	if (ds4->dpad == 3 || ds4->dpad == 4 || ds4->dpad == 5)
-		buttons |= SCE_CTRL_DOWN;
-	if (ds4->dpad == 5 || ds4->dpad == 6 || ds4->dpad == 7)
-		buttons |= SCE_CTRL_LEFT;
-
-	if (ds4->l1)
-		buttons |= SCE_CTRL_L1;
-	if (ds4->r1)
-		buttons |= SCE_CTRL_R1;
-
-	if (ds4->l2)
-		buttons |= SCE_CTRL_LTRIGGER;
-	if (ds4->r2)
-		buttons |= SCE_CTRL_RTRIGGER;
-
-	if (ds4->l3)
-		buttons |= SCE_CTRL_L3;
-	if (ds4->r3)
-		buttons |= SCE_CTRL_R3;
-
-	if (ds4->share)
-		buttons |= SCE_CTRL_SELECT;
-	if (ds4->options)
-		buttons |= SCE_CTRL_START;
-	if (ds4->ps)
-		buttons |= SCE_CTRL_INTERCEPTED;
-
-	if ((abs(ds4->left_x - 128) > DS4_ANALOG_THRESHOLD) ||
-	    (abs(ds4->left_y - 128) > DS4_ANALOG_THRESHOLD) ||
-	    (abs(ds4->right_x - 128) > DS4_ANALOG_THRESHOLD) ||
-	    (abs(ds4->right_y - 128) > DS4_ANALOG_THRESHOLD) ||
-	    ds4->l_trigger > DS4_ANALOG_THRESHOLD ||
-	    ds4->r_trigger > DS4_ANALOG_THRESHOLD) {
-		js_moved = 1;
-	}
-
-	ksceCtrlSetButtonEmulation(0, 0, buttons, buttons, 32);
-
-	ksceCtrlSetAnalogEmulation(0, 0, ds4->left_x, ds4->left_y,
-		ds4->right_x, ds4->right_y, ds4->left_x, ds4->left_y,
-		ds4->right_x, ds4->right_y, 1);
-
-	if (buttons != 0 || js_moved)
-		ksceKernelPowerTick(0);
+  return ret;
 }
 
-static void patch_analogdata(int port, SceCtrlData *pad_data, int count,
-			    struct ds4_input_report *ds4)
-{
-	unsigned int i;
+DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, int port, SceCtrlData *pad_data, int count) {
+  int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositive2_ref, port, pad_data, count);
 
-	for (i = 0; i < count; i++) {
-		SceCtrlData k_data;
+  if (ret >= 0 && ds4_connected) patch_analogdata(port, pad_data, count, &ds4_input);
 
-		ksceKernelMemcpyUserToKernel(&k_data, (uintptr_t)pad_data, sizeof(k_data));
-		if (abs(ds4->left_x - 128) > DS4_ANALOG_THRESHOLD)
-			k_data.lx = ds4->left_x;
-		if (abs(ds4->left_y - 128) > DS4_ANALOG_THRESHOLD)
-			k_data.ly = ds4->left_y;
-		if (abs(ds4->right_x - 128) > DS4_ANALOG_THRESHOLD)
-			k_data.rx = ds4->right_x;
-		if (abs(ds4->right_y - 128) > DS4_ANALOG_THRESHOLD)
-			k_data.ry = ds4->right_y;
-		if (ds4->l_trigger > DS4_ANALOG_THRESHOLD)
-			k_data.lt = ds4->l_trigger;
-		if (ds4->r_trigger > DS4_ANALOG_THRESHOLD)
-			k_data.rt = ds4->r_trigger;
-		ksceKernelMemcpyKernelToUser((uintptr_t)pad_data, &k_data, sizeof(k_data));
-
-		pad_data++;
-	}
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, SceCtrlPortInfo *info)
-{
-	int ret = TAI_CONTINUE(int, SceCtrl_ksceCtrlGetControllerPortInfo_ref, info);
+DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2, int port, SceCtrlData *pad_data, int count) {
+  int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositive2_ref, port, pad_data, count);
 
-	if (ret >= 0 && ds4_connected) {
-		// info->port[0] |= SCE_CTRL_TYPE_VIRT;
-		info->port[1] = SCE_CTRL_TYPE_DS4;
-	}
+  if (ret >= 0 && ds4_connected) patch_analogdata(port, pad_data, count, &ds4_input);
 
-	return ret;
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceCtrl_sceCtrlGetBatteryInfo, int port, SceUInt8 *batt)
-{
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlGetBatteryInfo_ref, port, batt);
+DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, int port, SceCtrlData *pad_data, int count) {
+  int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositiveExt2_ref, port, pad_data, count);
 
-	if (ds4_connected && port == 1) {
-		SceUInt8 k_batt;
-		ksceKernelMemcpyUserToKernel(&k_batt, (uintptr_t)batt, sizeof(k_batt));
-		if (ds4_input.usb_plugged) {
-			k_batt = ds4_input.battery_level <= 10 ? 0xEE : 0xEF;
-		} else {
-			if (ds4_input.battery_level == 0) k_batt = 0;
-			else k_batt = (ds4_input.battery_level / 2) + 1;
-			if (k_batt > 5) k_batt = 5;
-		}
-		ksceKernelMemcpyKernelToUser((uintptr_t)batt, &k_batt, sizeof(k_batt));
-		return 0;
-	}
+  if (ret >= 0 && ds4_connected) patch_analogdata(port, pad_data, count, &ds4_input);
 
-	return ret;
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, int port, SceCtrlData *pad_data, int count)
-{
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositive2_ref, port, pad_data, count);
+DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, int port, SceCtrlData *pad_data, int count) {
+  int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositiveExt2_ref, port, pad_data, count);
 
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
+  if (ret >= 0 && ds4_connected) patch_analogdata(port, pad_data, count, &ds4_input);
 
-	return ret;
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2, int port, SceCtrlData *pad_data, int count)
-{
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositive2_ref, port, pad_data, count);
+static void patch_touchdata(SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs, struct ds4_input_report *ds4) {
+  unsigned int i;
 
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
+  if (port != SCE_TOUCH_PORT_FRONT) return;
 
-	return ret;
+  for (i = 0; i < nBufs; i++) {
+    unsigned int num_reports = 0;
+
+    if (!ds4->finger1_activelow) {
+      pData->report[0].id = ds4->finger1_id;
+      pData->report[0].x = (ds4->finger1_x * VITA_FRONT_TOUCHSCREEN_W) / DS4_TOUCHPAD_W;
+      pData->report[0].y = (ds4->finger1_y * VITA_FRONT_TOUCHSCREEN_H) / DS4_TOUCHPAD_H;
+      num_reports++;
+    }
+
+    if (!ds4->finger2_activelow) {
+      pData->report[1].id = ds4->finger2_id;
+      pData->report[1].x = (ds4->finger2_x * VITA_FRONT_TOUCHSCREEN_W) / DS4_TOUCHPAD_W;
+      pData->report[1].y = (ds4->finger2_y * VITA_FRONT_TOUCHSCREEN_H) / DS4_TOUCHPAD_H;
+      num_reports++;
+    }
+
+    if (num_reports > 0) {
+      ksceKernelPowerTick(0);
+      pData->reportNum = num_reports;
+    }
+
+    pData++;
+  }
 }
 
-DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, int port, SceCtrlData *pad_data, int count)
-{
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositiveExt2_ref, port, pad_data, count);
+DECL_FUNC_HOOK(SceTouch_ksceTouchPeek, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs) {
+  int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeek_ref, port, pData, nBufs);
 
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
+  if (ret >= 0 && ds4_connected) patch_touchdata(port, pData, nBufs, &ds4_input);
 
-	return ret;
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, int port, SceCtrlData *pad_data, int count)
-{
-	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositiveExt2_ref, port, pad_data, count);
+DECL_FUNC_HOOK(SceTouch_ksceTouchPeekRegion, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs, int region) {
+  int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeekRegion_ref, port, pData, nBufs, region);
 
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
+  if (ret >= 0 && ds4_connected) patch_touchdata(port, pData, nBufs, &ds4_input);
 
-	return ret;
+  return ret;
 }
 
-static void patch_touchdata(SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs,
-			    struct ds4_input_report *ds4)
-{
-	unsigned int i;
+DECL_FUNC_HOOK(SceTouch_ksceTouchRead, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs) {
+  int ret = TAI_CONTINUE(int, SceTouch_ksceTouchRead_ref, port, pData, nBufs);
 
-	if (port != SCE_TOUCH_PORT_FRONT)
-		return;
+  if (ret >= 0 && ds4_connected) patch_touchdata(port, pData, nBufs, &ds4_input);
 
-	for (i = 0; i < nBufs; i++) {
-		unsigned int num_reports = 0;
-
-		if (!ds4->finger1_activelow) {
-			pData->report[0].id = ds4->finger1_id;
-			pData->report[0].x = (ds4->finger1_x * VITA_FRONT_TOUCHSCREEN_W) / DS4_TOUCHPAD_W;
-			pData->report[0].y = (ds4->finger1_y * VITA_FRONT_TOUCHSCREEN_H) / DS4_TOUCHPAD_H;
-			num_reports++;
-		}
-
-		if (!ds4->finger2_activelow) {
-			pData->report[1].id = ds4->finger2_id;
-			pData->report[1].x = (ds4->finger2_x * VITA_FRONT_TOUCHSCREEN_W) / DS4_TOUCHPAD_W;
-			pData->report[1].y = (ds4->finger2_y * VITA_FRONT_TOUCHSCREEN_H) / DS4_TOUCHPAD_H;
-			num_reports++;
-		}
-
-		if (num_reports > 0) {
-			ksceKernelPowerTick(0);
-			pData->reportNum = num_reports;
-		}
-
-		pData++;
-	}
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceTouch_ksceTouchPeek, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs)
-{
-	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeek_ref, port, pData, nBufs);
+DECL_FUNC_HOOK(SceTouch_ksceTouchReadRegion, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs, int region) {
+  int ret = TAI_CONTINUE(int, SceTouch_ksceTouchReadRegion_ref, port, pData, nBufs, region);
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
+  if (ret >= 0 && ds4_connected) patch_touchdata(port, pData, nBufs, &ds4_input);
 
-	return ret;
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceTouch_ksceTouchPeekRegion, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs, int region)
-{
-	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeekRegion_ref, port, pData, nBufs, region);
+static void patch_motion_state(SceMotionState *motionState, struct ds4_input_report *ds4) {
+  SceMotionState k_data;
+  SceMotionState *u_data = motionState;
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
-
-	return ret;
+  ksceKernelMemcpyUserToKernel(&k_data, u_data, sizeof(k_data));
+  k_data.acceleration.x = ds4->accel_x;
+  k_data.acceleration.y = ds4->accel_y;
+  k_data.acceleration.y = ds4->accel_z;
+  ksceKernelMemcpyKernelToUser(u_data, &k_data, sizeof(k_data));
 }
 
-DECL_FUNC_HOOK(SceTouch_ksceTouchRead, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs)
-{
-	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchRead_ref, port, pData, nBufs);
+DECL_FUNC_HOOK(SceMotion_sceMotionGetState, SceMotionState *motionState) {
+  int ret = TAI_CONTINUE(int, SceMotion_sceMotionGetState_ref, motionState);
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
+  if (ret >= 0 && ds4_connected) patch_motion_state(motionState, &ds4_input);
 
-	return ret;
+  return ret;
 }
 
-DECL_FUNC_HOOK(SceTouch_ksceTouchReadRegion, SceUInt32 port, SceTouchData *pData, SceUInt32 nBufs, int region)
-{
-	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchReadRegion_ref, port, pData, nBufs, region);
+static void enqueue_read_request(unsigned int mac0, unsigned int mac1, SceBtHidRequest *request, unsigned char *buffer,
+                                 unsigned int length) {
+  memset(request, 0, sizeof(*request));
+  memset(buffer, 0, length);
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
+  request->type = 0;
+  request->buffer = buffer;
+  request->length = length;
+  request->next = request;
 
-	return ret;
+  ksceBtHidTransfer(mac0, mac1, request);
 }
 
-static void patch_motion_state(SceMotionState *motionState, struct ds4_input_report *ds4)
-{
-	SceMotionState k_data;
-	SceMotionState *u_data = motionState;
+DECL_FUNC_HOOK(SceBt_sub_22999C8, void *dev_base_ptr, int r1) {
+  unsigned int flags = *(unsigned int *)(r1 + 4);
 
-	ksceKernelMemcpyUserToKernel(&k_data, (uintptr_t)u_data, sizeof(k_data));
-	k_data.acceleration.x = ds4->accel_x;
-	k_data.acceleration.y = ds4->accel_y;
-	k_data.acceleration.y = ds4->accel_z;
-	ksceKernelMemcpyKernelToUser((uintptr_t)u_data, &k_data, sizeof(k_data));
+  if (dev_base_ptr && !(flags & 2)) {
+    const void *dev_info = *(const void **)(dev_base_ptr + 0x14A4);
+    const unsigned short *vid_pid = (const unsigned short *)(dev_info + 0x28);
+
+    if (is_ds4(vid_pid)) {
+      unsigned int *v8_ptr = (unsigned int *)(*(unsigned int *)dev_base_ptr + 8);
+
+      /*
+       * We need to enable the following bits in order to make the Vita
+       * accept the new connection, otherwise it will refuse it.
+       */
+      *v8_ptr |= 0x11000;
+    }
+  }
+
+  return TAI_CONTINUE(int, SceBt_sub_22999C8_ref, dev_base_ptr, r1);
 }
 
-DECL_FUNC_HOOK(SceMotion_sceMotionGetState, SceMotionState *motionState)
-{
-	int ret = TAI_CONTINUE(int, SceMotion_sceMotionGetState_ref, motionState);
+static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common) {
+  static SceBtHidRequest hid_request;
+  static unsigned char recv_buff[0x100];
 
-	if (ret >= 0 && ds4_connected)
-		patch_motion_state(motionState, &ds4_input);
+  while (1) {
+    int ret;
+    SceBtEvent hid_event;
 
-	return ret;
+    memset(&hid_event, 0, sizeof(hid_event));
+
+    do {
+      ret = ksceBtReadEvent(&hid_event, 1);
+    } while (ret == SCE_BT_ERROR_CB_OVERFLOW);
+
+    if (ret <= 0) {
+      break;
+    }
+
+    /*
+     * If we get an event with a MAC, and the MAC is different
+     * from the connected DS4, skip the event.
+     */
+    if (ds4_connected) {
+      if (hid_event.mac0 != ds4_mac0 || hid_event.mac1 != ds4_mac1) continue;
+    }
+
+    LOG("->Event:");
+    for (int i = 0; i < 0x10; i++) LOG(" %02X", hid_event.data[i]);
+    LOG("\n");
+
+    switch (hid_event.id) {
+      case 0x01: {  // Inquiry result event
+        unsigned short vid_pid[2];
+        ksceBtGetVidPid(hid_event.mac0, hid_event.mac1, vid_pid);
+
+        if (is_ds4(vid_pid)) {
+          ksceBtStopInquiry();
+          ds4_mac0 = hid_event.mac0;
+          ds4_mac1 = hid_event.mac1;
+        }
+        break;
+      }
+
+      case 0x02:  // Inquiry stop event
+        if (!ds4_connected) {
+          if (ds4_mac0 || ds4_mac1) ksceBtStartConnect(ds4_mac0, ds4_mac1);
+        }
+        break;
+
+      case 0x04:  // Link key request? event
+        ksceBtReplyUserConfirmation(hid_event.mac0, hid_event.mac1, 1);
+        break;
+
+      case 0x05: {  // Connection accepted event
+        unsigned short vid_pid[2];
+        ksceBtGetVidPid(hid_event.mac0, hid_event.mac1, vid_pid);
+
+        if (is_ds4(vid_pid)) {
+          ds4_input_reset();
+          ds4_mac0 = hid_event.mac0;
+          ds4_mac1 = hid_event.mac1;
+          ds4_connected = 1;
+          ds4_send_0x11_report(hid_event.mac0, hid_event.mac1);
+        }
+        break;
+      }
+
+      case 0x06:  // Device disconnect event
+        ds4_connected = 0;
+        reset_input_emulation();
+        break;
+
+      case 0x08:  // Connection requested event
+        /* Do nothing since we will get a 0x05 event afterwards. */
+        break;
+
+      case 0x09:  // Connection request without being paired? event
+        /*
+         * The Vita needs to have a pairing with the DS4,
+         * otherwise it won't connect.
+         */
+        break;
+
+      case 0x0A:  // HID reply to 0-type request
+
+        LOG("DS4 0x0A event: 0x%02X\n", recv_buff[0]);
+
+        switch (recv_buff[0]) {
+          case 0x11:
+            memcpy(&ds4_input, recv_buff, sizeof(ds4_input));
+
+            set_input_emulation(&ds4_input);
+
+            enqueue_read_request(hid_event.mac0, hid_event.mac1, &hid_request, recv_buff, sizeof(recv_buff));
+            break;
+
+          default:
+            LOG("Unknown DS4 event: 0x%02X\n", recv_buff[0]);
+            break;
+        }
+
+        break;
+
+      case 0x0B:  // HID reply to 1-type request
+
+        // LOG("DS4 0x0B event: 0x%02X\n", recv_buff[0]);
+
+        enqueue_read_request(hid_event.mac0, hid_event.mac1, &hid_request, recv_buff, sizeof(recv_buff));
+        break;
+    }
+  }
+
+  return 0;
 }
 
-static void enqueue_read_request(unsigned int mac0, unsigned int mac1,
-				 SceBtHidRequest *request, unsigned char *buffer,
-				 unsigned int length)
-{
-	memset(request, 0, sizeof(*request));
-	memset(buffer, 0, length);
+static int ds4vita_bt_thread(SceSize args, void *argp) {
+  bt_cb_uid = ksceKernelCreateCallback("ds4vita_bt_callback", 0, bt_cb_func, NULL);
 
-	request->type = 0;
-	request->buffer = buffer;
-	request->length = length;
-	request->next = request;
+  ksceBtRegisterCallback(bt_cb_uid, 0, 0xFFFFFFFF, 0xFFFFFFFF);
 
-	ksceBtHidTransfer(mac0, mac1, request);
+  /*#ifndef RELEASE
+          ksceBtStartInquiry();
+          ksceKernelDelayThreadCB(4 * 1000 * 1000);
+          ksceBtStopInquiry();
+  #endif*/
+
+  while (bt_thread_run) {
+    ksceKernelDelayThreadCB(BT_THREAD_SLEEP_MS * 1000);
+    if (log_pending()) log_flush();
+  }
+
+  if (ds4_connected) {
+    ksceBtStartDisconnect(ds4_mac0, ds4_mac1);
+    reset_input_emulation();
+  }
+
+  ksceBtUnregisterCallback(bt_cb_uid);
+
+  ksceKernelDeleteCallback(bt_cb_uid);
+
+  return 0;
 }
 
-DECL_FUNC_HOOK(SceBt_sub_22999C8, void *dev_base_ptr, int r1)
-{
-	unsigned int flags = *(unsigned int *)(r1 + 4);
+void _start() __attribute__((weak, alias("module_start")));
 
-	if (dev_base_ptr && !(flags & 2)) {
-		const void *dev_info = *(const void **)(dev_base_ptr + 0x14A4);
-		const unsigned short *vid_pid = (const unsigned short *)(dev_info + 0x28);
+/*
+ * Localizacion del texto de SceBt a partir de su tabla de exports.
+ *
+ * SceBt se reubica en cada arranque, asi que no se pueden usar direcciones
+ * fijas. Se copia a RAM una ventana alrededor del descriptor de exports
+ * (la unica lectura de memoria de nucleo) y se trabaja sobre la copia.
+ *
+ * Layout del descriptor (deducido del volcado):
+ *   +0x08  numero de librerias
+ *   +0x20  entradas de libreria de 0x20 bytes:
+ *            +0x04  exports: mitad alta = numero
+ *            +0x10  libnid
+ *            +0x18  puntero a la tabla de NIDs (ordenados)
+ *            +0x1C  puntero a la tabla de punteros (mismo indice)
+ *
+ * Se busca ksceBtHidTransfer en SceBtForDriver y se devuelve el MINIMO de
+ * los punteros de esa tabla, que se usa como referencia (pagina) del texto
+ * del modulo. Devuelve 0 si no se resuelve.
+ */
+#define EXP_PRE 0x1000u
+#define EXP_LEN 0x4000u
 
-		if (is_ds4(vid_pid)) {
-			unsigned int *v8_ptr = (unsigned int *)(*(unsigned int *)dev_base_ptr + 8);
+#define EXP_DESC_NLIBS_OFF 0x08u
+#define EXP_LIB_SIZE 0x20u
+#define EXP_LIB_FIRST 0x20u
 
-			/*
-			 * We need to enable the following bits in order to make the Vita
-			 * accept the new connection, otherwise it will refuse it.
-			 */
-			*v8_ptr |= 0x11000;
-		}
-	}
+#define EXP_LE_COUNT 0x04u
+#define EXP_LE_LIBNID 0x10u
+#define EXP_LE_NIDS 0x18u
+#define EXP_LE_PTRS 0x1Cu
 
-	return TAI_CONTINUE(int, SceBt_sub_22999C8_ref, dev_base_ptr, r1);
+#define EXP_MAX_LIBS 8u
+#define EXP_MAX_FUNCS 4096u
+
+#define HID_FUNC_NID 0xF9DCEC77u  // ksceBtHidTransfer
+#define HID_LIB_NID 0xD48CA62Du   // SceBtForDriver
+
+static unsigned char exports_buf[EXP_LEN] __attribute__((aligned(4)));
+
+static unsigned int scebt_find_text_min(const tai_module_info_t *mi) {
+  const unsigned char *desc;
+  unsigned int base;
+  unsigned int n_libs;
+  unsigned int i;
+
+  if (mi->exports_start < EXP_PRE) {
+    LOG("[BTEXP] exports_start 0x%08X muy bajo\n", mi->exports_start);
+    return 0;
+  }
+
+  base = mi->exports_start - EXP_PRE;
+  memcpy(exports_buf, (const void *)base, EXP_LEN);
+
+  desc = exports_buf + EXP_PRE;
+  n_libs = *(const unsigned int *)(desc + EXP_DESC_NLIBS_OFF);
+
+  if (n_libs == 0 || n_libs > EXP_MAX_LIBS) {
+    LOG("[BTFN] numero de librerias implausible: %u\n", n_libs);
+    return 0;
+  }
+
+  for (i = 0; i < n_libs; i++) {
+    const unsigned char *le = desc + EXP_LIB_FIRST + i * EXP_LIB_SIZE;
+    unsigned int count = *(const unsigned int *)(le + EXP_LE_COUNT) >> 16;
+    unsigned int libnid = *(const unsigned int *)(le + EXP_LE_LIBNID);
+    unsigned int nids = *(const unsigned int *)(le + EXP_LE_NIDS);
+    unsigned int ptrs = *(const unsigned int *)(le + EXP_LE_PTRS);
+    unsigned int nids_off, ptrs_off, j;
+
+    if (libnid != HID_LIB_NID) continue;
+
+    if (nids < base || ptrs < base || nids >= base + EXP_LEN || ptrs >= base + EXP_LEN) continue;
+
+    nids_off = nids - base;
+    ptrs_off = ptrs - base;
+
+    if (count == 0 || count > EXP_MAX_FUNCS || nids_off + count * 4u > EXP_LEN || ptrs_off + count * 4u > EXP_LEN)
+      continue;
+
+    for (j = 0; j < count; j++) {
+      unsigned int minp = 0xFFFFFFFFu;
+      unsigned int k;
+
+      if (*(const unsigned int *)(exports_buf + nids_off + j * 4u) != HID_FUNC_NID) continue;
+
+      for (k = 0; k < count; k++) {
+        unsigned int p = *(const unsigned int *)(exports_buf + ptrs_off + k * 4u) & ~1u;
+
+        if (p != 0 && p < minp) minp = p;
+      }
+
+      LOG("[BTFN] ksceBtHidTransfer indice=%u, punteros min=0x%08X\n", j, minp);
+      return minp == 0xFFFFFFFFu ? 0 : minp;
+    }
+  }
+
+  LOG("[BTFN] no se resolvio ksceBtHidTransfer\n");
+  return 0;
 }
-
-static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common)
-{
-	static SceBtHidRequest hid_request;
-	static unsigned char recv_buff[0x100];
-
-	while (1) {
-		int ret;
-		SceBtEvent hid_event;
-
-		memset(&hid_event, 0, sizeof(hid_event));
-
-		do {
-			ret = ksceBtReadEvent(&hid_event, 1);
-		} while (ret == SCE_BT_ERROR_CB_OVERFLOW);
-
-		if (ret <= 0) {
-			break;
-		}
-
-		LOG("->Event:");
-		for (int i = 0; i < 0x10; i++)
-			LOG(" %02X", hid_event.data[i]);
-		LOG("\n");
-
-		/*
-		 * If we get an event with a MAC, and the MAC is different
-		 * from the connected DS4, skip the event.
-		 */
-		if (ds4_connected) {
-			if (hid_event.mac0 != ds4_mac0 || hid_event.mac1 != ds4_mac1)
-				continue;
-		}
-
-		switch (hid_event.id) {
-		case 0x01: { /* Inquiry result event */
-			unsigned short vid_pid[2];
-			ksceBtGetVidPid(hid_event.mac0, hid_event.mac1, vid_pid);
-
-			if (is_ds4(vid_pid)) {
-				ksceBtStopInquiry();
-				ds4_mac0 = hid_event.mac0;
-				ds4_mac1 = hid_event.mac1;
-			}
-			break;
-		}
-
-		case 0x02: /* Inquiry stop event */
-			if (!ds4_connected) {
-				if (ds4_mac0 || ds4_mac1)
-					ksceBtStartConnect(ds4_mac0, ds4_mac1);
-			}
-			break;
-
-		case 0x04: /* Link key request? event */
-			ksceBtReplyUserConfirmation(hid_event.mac0, hid_event.mac1, 1);
-			break;
-
-		case 0x05: { /* Connection accepted event */
-			unsigned short vid_pid[2];
-			ksceBtGetVidPid(hid_event.mac0, hid_event.mac1, vid_pid);
-
-			if (is_ds4(vid_pid)) {
-				ds4_input_reset();
-				ds4_mac0 = hid_event.mac0;
-				ds4_mac1 = hid_event.mac1;
-				ds4_connected = 1;
-				ds4_send_0x11_report(hid_event.mac0, hid_event.mac1);
-			}
-			break;
-		}
-
-
-		case 0x06: /* Device disconnect event*/
-			ds4_connected = 0;
-			reset_input_emulation();
-			break;
-
-		case 0x08: /* Connection requested event */
-			/*
-			 * Do nothing since we will get a 0x05 event afterwards.
-			 */
-			break;
-
-		case 0x09: /* Connection request without being paired? event */
-			/*
-			 * The Vita needs to have a pairing with the DS4,
-			 * otherwise it won't connect.
-			 */
-			break;
-
-		case 0x0A: /* HID reply to 0-type request */
-
-			LOG("DS4 0x0A event: 0x%02X\n", recv_buff[0]);
-
-			switch (recv_buff[0]) {
-			case 0x11:
-				memcpy(&ds4_input, recv_buff, sizeof(ds4_input));
-
-				set_input_emulation(&ds4_input);
-
-				enqueue_read_request(hid_event.mac0, hid_event.mac1,
-					&hid_request, recv_buff, sizeof(recv_buff));
-				break;
-
-			default:
-				LOG("Unknown DS4 event: 0x%02X\n", recv_buff[0]);
-				break;
-			}
-
-			break;
-
-		case 0x0B: /* HID reply to 1-type request */
-
-			//LOG("DS4 0x0B event: 0x%02X\n", recv_buff[0]);
-
-			enqueue_read_request(hid_event.mac0, hid_event.mac1,
-				&hid_request, recv_buff, sizeof(recv_buff));
-
-			break;
-		}
-	}
-
-	return 0;
-}
-
-static int ds4vita_bt_thread(SceSize args, void *argp)
-{
-	bt_cb_uid = ksceKernelCreateCallback("ds4vita_bt_callback", 0, bt_cb_func, NULL);
-
-	ksceBtRegisterCallback(bt_cb_uid, 0, 0xFFFFFFFF, 0xFFFFFFFF);
-
-/*#ifndef RELEASE
-	ksceBtStartInquiry();
-	ksceKernelDelayThreadCB(4 * 1000 * 1000);
-	ksceBtStopInquiry();
-#endif*/
-
-	while (bt_thread_run) {
-		ksceKernelDelayThreadCB(200 * 1000);
-	}
-
-	if (ds4_connected) {
-		ksceBtStartDisconnect(ds4_mac0, ds4_mac1);
-		reset_input_emulation();
-	}
-
-	ksceBtUnregisterCallback(bt_cb_uid);
-
-	ksceKernelDeleteCallback(bt_cb_uid);
-
-	return 0;
-}
-
-void _start() __attribute__ ((weak, alias ("module_start")));
 
 #define BIND_FUNC_OFFSET_HOOK(name, pid, modid, segidx, offset, thumb) \
-	name##_hook_uid = taiHookFunctionOffsetForKernel((pid), \
-		&name##_ref, (modid), (segidx), (offset), thumb, name##_hook_func)
+    name##_hook_uid = taiHookFunctionOffsetForKernel((pid), &name##_ref, (modid), (segidx), (offset), thumb, name##_hook_func)
 
 #define BIND_FUNC_EXPORT_HOOK(name, pid, module, lib_nid, func_nid) \
-	name##_hook_uid = taiHookFunctionExportForKernel((pid), \
-		&name##_ref, (module), (lib_nid), (func_nid), name##_hook_func)
+    name##_hook_uid = taiHookFunctionExportForKernel((pid), &name##_ref, (module), (lib_nid), (func_nid), name##_hook_func)
 
-int module_start(SceSize argc, const void *args)
-{
-	int ret;
-	tai_module_info_t SceBt_modinfo;
+int module_start(SceSize argc, const void *args) {
+  int ret;
+  tai_module_info_t SceBt_modinfo;
+  unsigned int scebt_minp;
 
-	log_reset();
+  log_reset();
 
-	LOG("ds4vita by xerpi\n");
+  LOG("ds4vita by xerpi\n");
 
-	SceBt_modinfo.size = sizeof(SceBt_modinfo);
-	ret = taiGetModuleInfoForKernel(KERNEL_PID, "SceBt", &SceBt_modinfo);
-	if (ret < 0) {
-		LOG("Error finding SceBt module\n");
-		goto error_find_scebt;
-	}
+  SceBt_modinfo.size = sizeof(SceBt_modinfo);
+  ret = taiGetModuleInfoForKernel(KERNEL_PID, "SceBt", &SceBt_modinfo);
+  if (ret < 0) {
+    LOG("Error finding SceBt module\n");
+    goto error_find_scebt;
+  }
 
-	/* SceBt hooks */
-	BIND_FUNC_OFFSET_HOOK(SceBt_sub_22999C8, KERNEL_PID,
-		SceBt_modinfo.modid, 0, 0x22999C8 - 0x2280000, 1);
+  scebt_minp = scebt_find_text_min(&SceBt_modinfo);
 
-	/* Patch PAD Type */
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0xF11D0D30);
+  // SceBt hooks
+  BIND_FUNC_OFFSET_HOOK(SceBt_sub_22999C8, KERNEL_PID, SceBt_modinfo.modid, 0, 0x22999C8 - 0x2280000, 1);
 
-	/* Patch Battery level */
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlGetBatteryInfo, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x8F9B1CE5);
+  // Bypass del "35-second drop" (ver cabecera del fichero)
+  if (scebt_minp) {
+    unsigned char *p = (unsigned char *)((scebt_minp & ~0xFFFu) + DROP_FIX_OFFSET);
+    static const unsigned char sig[2] = {0x01, 0x23};  // movs r3,#1
+    static const unsigned char fix[2] = {0x00, 0x23};  // movs r3,#0
 
-	/* SceCtrl hooks (needed for PS4 remote play) */
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x15F81E8C);
+    if (memcmp(p, sig, 2) == 0 && SceBt_modinfo.module_nid == SCEBT_FW365_NID) {
+      drop_fix_uid = taiInjectDataForKernel(KERNEL_PID, SceBt_modinfo.modid, 0, DROP_FIX_OFFSET, fix, 2);
+      LOG("[FIX] DS4 35s-drop bypass instalado @%08X "
+          "(sub_12800+0x1D2): movs r3,#1 -> 0\n",
+          (unsigned int)p);
+    } else {
+      LOG("[FIX] bypass NO instalado (nid/size mismatch) %08X got %02X "
+          "%02X -> NO patch\n",
+          (unsigned int)p, p[0], p[1]);
+    }
+  }
 
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositive2, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0xC4226A3E);
+  // Patch PAD Type
+  BIND_FUNC_EXPORT_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo, KERNEL_PID, "SceCtrl", TAI_ANY_LIBRARY, 0xF11D0D30);
 
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0x860BF292);
+  // Patch Battery level
+  BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlGetBatteryInfo, KERNEL_PID, "SceCtrl", TAI_ANY_LIBRARY, 0x8F9B1CE5);
 
-	BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, KERNEL_PID,
-		"SceCtrl", TAI_ANY_LIBRARY, 0xA7178860);
+  // SceCtrl hooks (needed for PS4 remote play)
+  BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, KERNEL_PID, "SceCtrl", TAI_ANY_LIBRARY, 0x15F81E8C);
 
-	/* SceTouch hooks */
-	BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchPeek, KERNEL_PID,
-		"SceTouch", TAI_ANY_LIBRARY, 0xBAD1960B);
+  BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositive2, KERNEL_PID, "SceCtrl", TAI_ANY_LIBRARY, 0xC4226A3E);
 
-	BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchPeekRegion, KERNEL_PID,
-		"SceTouch", TAI_ANY_LIBRARY, 0x9B3F7207);
+  BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, KERNEL_PID, "SceCtrl", TAI_ANY_LIBRARY, 0x860BF292);
 
-	BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchRead, KERNEL_PID,
-		"SceTouch", TAI_ANY_LIBRARY, 0x70C8AACE);
+  BIND_FUNC_EXPORT_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, KERNEL_PID, "SceCtrl", TAI_ANY_LIBRARY, 0xA7178860);
 
-	BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchReadRegion, KERNEL_PID,
-		"SceTouch", TAI_ANY_LIBRARY, 0x9A91F624);
+  // SceTouch hooks
+  BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchPeek, KERNEL_PID, "SceTouch", TAI_ANY_LIBRARY, 0xBAD1960B);
 
-	/* SceMotion hooks */
-	BIND_FUNC_EXPORT_HOOK(SceMotion_sceMotionGetState, KERNEL_PID,
-		"SceMotion", TAI_ANY_LIBRARY, 0xBDB32767);
+  BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchPeekRegion, KERNEL_PID, "SceTouch", TAI_ANY_LIBRARY, 0x9B3F7207);
 
-	SceKernelHeapCreateOpt opt;
-	opt.size = 0x1C;
-	opt.uselock = 0x100;
-	opt.field_8 = 0x10000;
-	opt.field_C = 0;
-	opt.field_10 = 0;
-	opt.field_14 = 0;
-	opt.field_18 = 0;
+  BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchRead, KERNEL_PID, "SceTouch", TAI_ANY_LIBRARY, 0x70C8AACE);
 
-	bt_mempool_uid = ksceKernelCreateHeap("ds4vita_mempool", 0x100, &opt);
-	LOG("Bluetooth mempool UID: 0x%08X\n", bt_mempool_uid);
+  BIND_FUNC_EXPORT_HOOK(SceTouch_ksceTouchReadRegion, KERNEL_PID, "SceTouch", TAI_ANY_LIBRARY, 0x9A91F624);
 
-	bt_thread_uid = ksceKernelCreateThread("ds4vita_bt_thread", ds4vita_bt_thread,
-		0x3C, 0x1000, 0, 0x10000, 0);
-	LOG("Bluetooth thread UID: 0x%08X\n", bt_thread_uid);
-	ksceKernelStartThread(bt_thread_uid, 0, NULL);
+  // SceMotion hooks
+  BIND_FUNC_EXPORT_HOOK(SceMotion_sceMotionGetState, KERNEL_PID, "SceMotion", TAI_ANY_LIBRARY, 0xBDB32767);
 
-	LOG("module_start finished successfully!\n");
+  SceKernelHeapCreateOpt opt;
+  opt.size = 0x1C;
+  opt.uselock = 0x100;
+  opt.field_8 = 0x10000;
+  opt.field_C = 0;
+  opt.field_14 = 0;
+  opt.field_18 = 0;
 
-	return SCE_KERNEL_START_SUCCESS;
+  bt_mempool_uid = ksceKernelCreateHeap("ds4vita_mempool", 0x100, &opt);
+  LOG("Bluetooth mempool UID: 0x%08X\n", bt_mempool_uid);
+
+  bt_thread_uid = ksceKernelCreateThread("ds4vita_bt_thread", ds4vita_bt_thread, 0x3C, 0x1000, 0, 0x10000, 0);
+  LOG("Bluetooth thread UID: 0x%08X\n", bt_thread_uid);
+  ksceKernelStartThread(bt_thread_uid, 0, NULL);
+
+  LOG("module_start finished successfully!\n");
+
+  return SCE_KERNEL_START_SUCCESS;
 
 error_find_scebt:
-	return SCE_KERNEL_START_FAILED;
+  return SCE_KERNEL_START_FAILED;
 }
 
 #define UNBIND_FUNC_HOOK(name) \
-	do { \
-		if (name##_hook_uid > 0) { \
-			taiHookReleaseForKernel(name##_hook_uid, name##_ref); \
-		} \
-	} while(0)
+    do { \
+        if (name##_hook_uid > 0) { \
+            taiHookReleaseForKernel(name##_hook_uid, name##_ref); \
+        } \
+    } while (0)
 
-int module_stop(SceSize argc, const void *args)
-{
-	SceUInt timeout = 0xFFFFFFFF;
+int module_stop(SceSize argc, const void *args) {
+  SceUInt timeout = 0xFFFFFFFF;
 
-	if (bt_thread_uid > 0) {
-		bt_thread_run = 0;
-		ksceKernelWaitThreadEnd(bt_thread_uid, NULL, &timeout);
-		ksceKernelDeleteThread(bt_thread_uid);
-	}
+  if (bt_thread_uid > 0) {
+    bt_thread_run = 0;
+    ksceKernelWaitThreadEnd(bt_thread_uid, NULL, &timeout);
+    ksceKernelDeleteThread(bt_thread_uid);
+  }
 
-	if (bt_mempool_uid > 0) {
-		ksceKernelDeleteHeap(bt_mempool_uid);
-	}
+  if (bt_mempool_uid > 0) {
+    ksceKernelDeleteHeap(bt_mempool_uid);
+  }
 
-	UNBIND_FUNC_HOOK(SceBt_sub_22999C8);
-	UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlGetBatteryInfo);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2);
-	UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2);
-	UNBIND_FUNC_HOOK(SceTouch_ksceTouchPeek);
-	UNBIND_FUNC_HOOK(SceTouch_ksceTouchPeekRegion);
-	UNBIND_FUNC_HOOK(SceTouch_ksceTouchRead);
-	UNBIND_FUNC_HOOK(SceTouch_ksceTouchReadRegion);
-	UNBIND_FUNC_HOOK(SceMotion_sceMotionGetState);
+  UNBIND_FUNC_HOOK(SceBt_sub_22999C8);
+  UNBIND_FUNC_HOOK(SceCtrl_ksceCtrlGetControllerPortInfo);
+  UNBIND_FUNC_HOOK(SceCtrl_sceCtrlGetBatteryInfo);
+  UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2);
+  UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2);
+  UNBIND_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2);
+  UNBIND_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2);
+  UNBIND_FUNC_HOOK(SceTouch_ksceTouchPeek);
+  UNBIND_FUNC_HOOK(SceTouch_ksceTouchPeekRegion);
+  UNBIND_FUNC_HOOK(SceTouch_ksceTouchRead);
+  UNBIND_FUNC_HOOK(SceTouch_ksceTouchReadRegion);
+  UNBIND_FUNC_HOOK(SceMotion_sceMotionGetState);
 
-	log_flush();
+  /*if (drop_fix_uid >= 0) {
+    taiInjectReleaseForKernel(drop_fix_uid);
+    drop_fix_uid = -1;
+  }*/
 
-	return SCE_KERNEL_STOP_SUCCESS;
+  log_flush();
+
+  return SCE_KERNEL_STOP_SUCCESS;
 }

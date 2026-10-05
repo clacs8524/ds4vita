@@ -1,3 +1,8 @@
+# About
+ds4vita modified to work with the GameSir Tarantula T3 Pro controller (firmware v2.06) in DS4 Bluetooth mode (LEDs 2, 3, and 4 lit up; GameSir button + B). 
+
+Special thanks to xerpi for the base code!
+
 # ds4vita
 
 **Download**: https://github.com/xerpi/ds4vita/releases
